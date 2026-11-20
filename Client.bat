@@ -4312,15 +4312,27 @@ def _rmr_install_bracket_strip():
 # ---- the launcher ------------------------------------------------------------------------------
 
 if (-not ('RmrClient.SkyForm' -as [type])) {
-    Add-Type -ReferencedAssemblies @('System.dll', 'System.Windows.Forms.dll', 'System.Drawing.dll') -TypeDefinition @'
+    $uiAssemblies = @('System.dll', 'System.Core.dll', 'System.Windows.Forms.dll', 'System.Drawing.dll', 'System.Xml.dll', 'System.Xml.Linq.dll')
+    foreach ($assembly in @('WindowsBase', 'PresentationCore', 'PresentationFramework', 'WindowsFormsIntegration', 'System.Xaml')) {
+        $uiAssemblies += [Reflection.Assembly]::LoadWithPartialName($assembly).Location
+    }
+    Add-Type -ReferencedAssemblies $uiAssemblies -TypeDefinition @'
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Linq;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Xml;
+using System.Xml.Linq;
+using Wpf = System.Windows;
+using Doc = System.Windows.Documents;
+using Media = System.Windows.Media;
 
 namespace RmrClient {
     public static class LauncherNews {
@@ -4348,6 +4360,290 @@ namespace RmrClient {
             byte[] frame = reader.ReadBytes(length);
             if (frame.Length != length) throw new EndOfStreamException("Incomplete news frame.");
             return frame;
+        }
+    }
+
+    // Render the feed's HTML as native text and links in the launcher.
+    public sealed class NewsReader : Wpf.Forms.Integration.ElementHost {
+        private static readonly Media.Brush Background = Brush(12, 17, 24);
+        private static readonly Media.Brush TextColor = Brush(218, 226, 234);
+        private static readonly Media.Brush Muted = Brush(154, 170, 188);
+        private static readonly Media.Brush Accent = Brush(111, 216, 199);
+        private static readonly Media.Brush Rule = Brush(40, 54, 68);
+        private static readonly Media.Brush CodeFill = Brush(21, 31, 43);
+        private static readonly Media.FontFamily FixedWidth = new Media.FontFamily("Consolas");
+        private static readonly Regex Links = new Regex(@"https?://[^\s<>""']+", RegexOptions.IgnoreCase);
+        private static readonly Regex Entities = new Regex(@"&(?!#(?:[0-9]+|x[0-9a-fA-F]+);)(?:[a-zA-Z][a-zA-Z0-9]*;)?");
+        private static readonly Regex VoidTags = new Regex(@"<(br|hr)\s*/?>", RegexOptions.IgnoreCase);
+        private const string ScrollStyle = @"
+<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+       xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='{x:Type ScrollBar}'>
+  <Setter Property='Width' Value='12'/>
+  <Setter Property='Template'>
+    <Setter.Value>
+      <ControlTemplate TargetType='{x:Type ScrollBar}'>
+        <Border Background='#101720' Padding='3'>
+          <Track x:Name='PART_Track' IsDirectionReversed='True'>
+            <Track.DecreaseRepeatButton>
+              <RepeatButton Command='{x:Static ScrollBar.PageUpCommand}' Opacity='0' Focusable='False'/>
+            </Track.DecreaseRepeatButton>
+            <Track.IncreaseRepeatButton>
+              <RepeatButton Command='{x:Static ScrollBar.PageDownCommand}' Opacity='0' Focusable='False'/>
+            </Track.IncreaseRepeatButton>
+            <Track.Thumb>
+              <Thumb Background='#455A69'>
+                <Thumb.Template>
+                  <ControlTemplate TargetType='{x:Type Thumb}'>
+                    <Border Background='{TemplateBinding Background}' CornerRadius='3'/>
+                  </ControlTemplate>
+                </Thumb.Template>
+              </Thumb>
+            </Track.Thumb>
+          </Track>
+        </Border>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>";
+
+        private readonly Wpf.Controls.FlowDocumentScrollViewer viewer = new Wpf.Controls.FlowDocumentScrollViewer();
+        private string title, date, body;
+
+        public NewsReader() {
+            viewer.Background = Background;
+            viewer.VerticalScrollBarVisibility = Wpf.Controls.ScrollBarVisibility.Auto;
+            viewer.HorizontalScrollBarVisibility = Wpf.Controls.ScrollBarVisibility.Disabled;
+            viewer.Resources.Add(typeof(Wpf.Controls.Primitives.ScrollBar), Wpf.Markup.XamlReader.Parse(ScrollStyle));
+            Wpf.Automation.AutomationProperties.SetName(viewer, "News article");
+            Child = viewer;
+        }
+
+        public void ShowMessage(string message) {
+            title = date = body = null;
+            var document = NewDocument();
+            document.Blocks.Add(new Doc.Paragraph(new Doc.Run(message)) { Foreground = Muted });
+            ShowDocument(document);
+        }
+
+        public void ShowArticle(string headline, string published, string html) {
+            if (title == headline && date == published && body == html) return;
+            title = headline; date = published; body = html;
+            var document = NewDocument();
+            if (!String.IsNullOrEmpty(published)) {
+                document.Blocks.Add(new Doc.Paragraph(new Doc.Run(published.ToUpperInvariant())) {
+                    Foreground = Accent, FontSize = 11, FontWeight = Wpf.FontWeights.SemiBold,
+                    LineHeight = 16, Margin = new Wpf.Thickness(0, 0, 0, 6)
+                });
+            }
+            document.Blocks.Add(new Doc.Paragraph(new Doc.Run(headline)) {
+                FontSize = 27, FontWeight = Wpf.FontWeights.SemiBold, LineHeight = 35,
+                BorderBrush = Rule, BorderThickness = new Wpf.Thickness(0, 0, 0, 1),
+                Padding = new Wpf.Thickness(0, 0, 0, 15), Margin = new Wpf.Thickness(0, 0, 0, 18)
+            });
+            var article = new Doc.Section();
+            try {
+                string fragment = VoidTags.Replace(html, "<$1 />");
+                fragment = Entities.Replace(fragment, m => System.Security.SecurityElement.Escape(WebUtility.HtmlDecode(m.Value)));
+                using (var text = new StringReader("<article>" + fragment + "</article>"))
+                using (var reader = XmlReader.Create(text, new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null })) {
+                    var root = XElement.Load(reader, LoadOptions.PreserveWhitespace);
+                    if (root.HasElements) AddBlocks(article.Blocks, root.Nodes(), 0);
+                    else AddPlainText(article.Blocks, root.Value);
+                }
+            } catch (XmlException) {
+                article.Blocks.Clear();
+                string plain = Regex.Replace(html, @"</(p|h[1-6]|li|blockquote|tr)>|<(br|hr)\s*/?>", "\n", RegexOptions.IgnoreCase);
+                plain = WebUtility.HtmlDecode(Regex.Replace(plain, "<[^>]+>", ""));
+                AddPlainText(article.Blocks, plain);
+            }
+            document.Blocks.Add(article);
+            ShowDocument(document);
+        }
+
+        private void ShowDocument(Doc.FlowDocument document) {
+            viewer.Document = document;
+            viewer.ApplyTemplate();
+            if (viewer.Template != null) {
+                var scroll = viewer.Template.FindName("PART_ContentHost", viewer) as Wpf.Controls.ScrollViewer;
+                if (scroll != null) scroll.ScrollToTop();
+            }
+        }
+
+        private static Doc.FlowDocument NewDocument() {
+            return new Doc.FlowDocument {
+                FontFamily = new Media.FontFamily("Segoe UI"), FontSize = 15, LineHeight = 23,
+                Foreground = TextColor, TextAlignment = Wpf.TextAlignment.Left,
+                PagePadding = new Wpf.Thickness(27, 24, 28, 26), MaxPageWidth = 740
+            };
+        }
+
+        private static Media.Brush Brush(byte r, byte g, byte b) {
+            var brush = new Media.SolidColorBrush(Media.Color.FromRgb(r, g, b));
+            brush.Freeze();
+            return brush;
+        }
+
+        private static Doc.Paragraph Paragraph() {
+            return new Doc.Paragraph { Margin = new Wpf.Thickness(0, 0, 0, 12) };
+        }
+
+        private static void AddPlainText(Doc.BlockCollection blocks, string text) {
+            var paragraph = Paragraph();
+            AddText(paragraph.Inlines, text, true);
+            blocks.Add(paragraph);
+        }
+
+        private static void AddBlocks(Doc.BlockCollection blocks, System.Collections.Generic.IEnumerable<XNode> nodes, int depth) {
+            if (depth > 32) return;
+            Doc.Paragraph current = null;
+            foreach (var node in nodes) {
+                var element = node as XElement;
+                var block = element == null ? null : RenderBlock(element, depth);
+                if (block != null) {
+                    blocks.Add(block);
+                    current = null;
+                } else {
+                    var text = node as XText;
+                    if (current == null && text != null && String.IsNullOrWhiteSpace(text.Value)) continue;
+                    if (current == null) { current = Paragraph(); blocks.Add(current); }
+                    AddInline(current.Inlines, node, depth, true);
+                }
+            }
+        }
+
+        private static Doc.Block RenderBlock(XElement element, int depth) {
+            string tag = element.Name.LocalName.ToLowerInvariant();
+            switch (tag) {
+                case "ul": case "ol":
+                    var list = new Doc.List {
+                        MarkerStyle = tag == "ol" ? Wpf.TextMarkerStyle.Decimal : Wpf.TextMarkerStyle.Disc,
+                        Margin = new Wpf.Thickness(0, 0, 0, 12), Padding = new Wpf.Thickness(25, 0, 0, 0)
+                    };
+                    foreach (var li in element.Elements("li")) {
+                        var item = new Doc.ListItem();
+                        AddBlocks(item.Blocks, li.Nodes(), depth + 1);
+                        foreach (var paragraph in item.Blocks.OfType<Doc.Paragraph>())
+                            paragraph.Margin = new Wpf.Thickness(0, 0, 0, 4);
+                        list.ListItems.Add(item);
+                    }
+                    return list;
+                case "blockquote": case "div": case "center":
+                    var section = new Doc.Section();
+                    if (tag == "center") section.TextAlignment = Wpf.TextAlignment.Center;
+                    if (tag == "blockquote") {
+                        section.BorderBrush = Rule;
+                        section.BorderThickness = new Wpf.Thickness(3, 0, 0, 0);
+                        section.Padding = new Wpf.Thickness(12, 0, 0, 0);
+                        section.Foreground = Muted;
+                    }
+                    AddBlocks(section.Blocks, element.Nodes(), depth + 1);
+                    return section;
+                case "table":
+                    return RenderTable(element, depth);
+                case "hr":
+                    return new Doc.Paragraph {
+                        BorderBrush = Rule, BorderThickness = new Wpf.Thickness(0, 1, 0, 0),
+                        FontSize = 1, LineHeight = 1, Margin = new Wpf.Thickness(0, 0, 0, 12)
+                    };
+                case "pre":
+                    var code = Paragraph();
+                    code.FontFamily = FixedWidth;
+                    code.Background = CodeFill;
+                    code.Padding = new Wpf.Thickness(10);
+                    code.Inlines.Add(new Doc.Run(element.Value.TrimEnd('\n', '\r')));
+                    return code;
+                case "h1": case "h2": case "h3": case "h4": case "h5": case "h6": case "p":
+                    var text = Paragraph();
+                    if (tag != "p") {
+                        text.FontSize = tag == "h1" || tag == "h2" ? 20 : 17;
+                        text.LineHeight = 28;
+                        text.FontWeight = Wpf.FontWeights.SemiBold;
+                        text.Margin = new Wpf.Thickness(0, 6, 0, 7);
+                    }
+                    foreach (var child in element.Nodes()) AddInline(text.Inlines, child, depth + 1, true);
+                    return text;
+                default: return null;
+            }
+        }
+
+        private static Doc.Table RenderTable(XElement element, int depth) {
+            var table = new Doc.Table { CellSpacing = 0, Margin = new Wpf.Thickness(0, 0, 0, 12) };
+            var group = new Doc.TableRowGroup();
+            table.RowGroups.Add(group);
+            var rows = element.Elements().SelectMany(child => child.Name.LocalName == "tr" ? new[] { child } : child.Elements("tr"));
+            foreach (var row in rows) {
+                var rendered = new Doc.TableRow();
+                foreach (var col in row.Elements().Where(c => c.Name.LocalName == "th" || c.Name.LocalName == "td")) {
+                    var cell = new Doc.TableCell {
+                        BorderBrush = Rule, BorderThickness = new Wpf.Thickness(0, 0, 1, 1), Padding = new Wpf.Thickness(7, 4, 7, 4)
+                    };
+                    if (col.Name.LocalName == "th") { cell.Background = CodeFill; cell.FontWeight = Wpf.FontWeights.SemiBold; }
+                    AddBlocks(cell.Blocks, col.Nodes(), depth + 1);
+                    foreach (var paragraph in cell.Blocks.OfType<Doc.Paragraph>()) paragraph.Margin = new Wpf.Thickness(0);
+                    rendered.Cells.Add(cell);
+                }
+                group.Rows.Add(rendered);
+            }
+            return table;
+        }
+
+        private static void AddInline(Doc.InlineCollection inlines, XNode node, int depth, bool linkText) {
+            if (depth > 32) return;
+            var text = node as XText;
+            if (text != null) { AddText(inlines, Regex.Replace(text.Value, @"[\r\n\t ]+", " "), linkText); return; }
+            var element = node as XElement;
+            if (element == null) return;
+            string tag = element.Name.LocalName.ToLowerInvariant();
+            Doc.Span span;
+            switch (tag) {
+                case "br": inlines.Add(new Doc.LineBreak()); return;
+                case "strong": case "b": span = new Doc.Bold(); break;
+                case "em": case "i": span = new Doc.Italic(); break;
+                case "u": span = new Doc.Underline(); break;
+                case "del": span = new Doc.Span { TextDecorations = Wpf.TextDecorations.Strikethrough }; break;
+                case "code": span = new Doc.Span { FontFamily = FixedWidth, Background = CodeFill, Foreground = Accent }; break;
+                case "big": span = new Doc.Span { FontSize = 17 }; break;
+                case "small": span = new Doc.Span { FontSize = 13 }; break;
+                case "a":
+                    span = linkText ? MakeLink((string)element.Attribute("href")) ?? new Doc.Span() : new Doc.Span();
+                    linkText = false;
+                    break;
+                case "script": case "style": case "iframe": case "object": case "img": return;
+                default: span = new Doc.Span(); break;
+            }
+            foreach (var child in element.Nodes()) AddInline(span.Inlines, child, depth + 1, linkText);
+            inlines.Add(span);
+        }
+
+        private static void AddText(Doc.InlineCollection inlines, string text, bool linkText) {
+            int end = 0;
+            if (linkText) {
+                foreach (Match match in Links.Matches(text)) {
+                    string address = match.Value.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']');
+                    var link = MakeLink(address);
+                    if (link == null) continue;
+                    if (match.Index > end) inlines.Add(new Doc.Run(text.Substring(end, match.Index - end)));
+                    link.Inlines.Add(new Doc.Run(address));
+                    inlines.Add(link);
+                    end = match.Index + address.Length;
+                }
+            }
+            if (end < text.Length) inlines.Add(new Doc.Run(text.Substring(end)));
+        }
+
+        private static Doc.Hyperlink MakeLink(string address) {
+            Uri url;
+            if (!Uri.TryCreate(address, UriKind.Absolute, out url) || (url.Scheme != "https" && url.Scheme != "http")) return null;
+            var link = new Doc.Hyperlink { NavigateUri = url, Foreground = Accent, ToolTip = url.AbsoluteUri };
+            link.RequestNavigate += (sender, e) => {
+                e.Handled = true;
+                try {
+                    using (System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url.AbsoluteUri) { UseShellExecute = true })) { }
+                } catch (System.ComponentModel.Win32Exception) {
+                    MessageBox.Show("Windows could not open the link.", "Red Moon Rising", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            };
+            return link;
         }
     }
 
@@ -4702,15 +4998,23 @@ $newsCaption.Font = $serversCaption.Font
 $newsCaption.ForeColor = $muted
 $newsCaption.BackColor = [Drawing.Color]::Transparent
 $newsCaption.SetBounds(348, 100, 600, 18)
+$newsPane = New-Object Windows.Forms.Panel
+$newsPane.BackColor = $panel
+$newsPane.Anchor = 'Top,Bottom,Left,Right'
+$newsPane.SetBounds(348, 124, ($form.ClientSize.Width - 372), ($form.ClientSize.Height - 240))
 $news = New-Object Windows.Forms.ListBox
 $news.DrawMode = 'OwnerDrawFixed'
-$news.ItemHeight = 78
+$news.ItemHeight = 72
 $news.BorderStyle = 'None'
-$news.BackColor = [Drawing.Color]::FromArgb(12, 17, 24)
+$news.BackColor = [Drawing.Color]::FromArgb(16, 23, 32)
 $news.ForeColor = $bright
 $news.IntegralHeight = $false
-$news.Anchor = 'Top,Bottom,Left,Right'
-$news.SetBounds(348, 124, ($form.ClientSize.Width - 372), ($form.ClientSize.Height - 240))
+$news.AccessibleName = 'News headlines'
+$news.Dock = 'Left'
+$news.Width = 228
+$newsReader = New-Object RmrClient.NewsReader
+$newsReader.Dock = 'Fill'
+$newsPane.Controls.AddRange(@($newsReader, $news))
 $playButton = New-Object Windows.Forms.Button
 $playButton.Text = 'PLAY'
 $playButton.Font = New-Object Drawing.Font('Segoe UI Semibold', 20)
@@ -4728,11 +5032,11 @@ $playStatus.BackColor = [Drawing.Color]::Transparent
 $playStatus.Anchor = 'Bottom,Left,Right'
 $playStatus.SetBounds(348, ($form.ClientSize.Height - 90), ($form.ClientSize.Width - 648), 60)
 
-$form.Controls.AddRange(@($title, $subtitle, $statusPill, $side, $newsCaption, $news, $playButton, $playStatus))
+$form.Controls.AddRange(@($title, $subtitle, $statusPill, $side, $newsCaption, $newsPane, $playButton, $playStatus))
 
 # ---- state ----
 
-$ui = @{ Status = @{}; Checks = @{}; NewsTask = $null; NewsClient = $null; NewsFor = ''; NewsAt = [DateTime]::MinValue; NewsMessage = ''; Articles = @() }
+$ui = @{ Status = @{}; Checks = @{}; NewsTask = $null; NewsClient = $null; NewsFor = ''; NewsAt = [DateTime]::MinValue; NewsPayload = ''; UpdatingNews = $false; Articles = @() }
 
 function Get-RmrSelected {
     $i = $list.SelectedIndex
@@ -4813,19 +5117,18 @@ function Update-RmrHeader {
     }
 }
 
-# Article text without its markup.
-function ConvertTo-RmrText([string]$Html) {
-    $t = $Html -replace '(?i)<br\s*/?>', "`n" -replace '(?i)<hr\s*/?>', "`n---`n" `
-        -replace '(?i)</t[dh]>\s*(?=<t[dh]\b)', ' | ' -replace '(?i)</(p|h\d|li|pre|tr|blockquote)>[ \t]*(?:\r?\n)?', "`n" `
-        -replace '(?i)<li>', ([string][char]0x2022 + ' ') -replace '<[^>]+>', ''
-    return ([Net.WebUtility]::HtmlDecode($t) -replace "`n{3,}", "`n`n").Trim()
-}
-
 function Set-RmrNewsMessage([string]$Message) {
     $ui.Articles = @()
-    $ui.NewsMessage = $Message
+    $ui.NewsPayload = ''
     $news.Items.Clear()
-    [void]$news.Items.Add('none')
+    $newsReader.ShowMessage($Message)
+}
+
+function Show-RmrSelectedArticle {
+    $i = $news.SelectedIndex
+    if ($ui.UpdatingNews -or $i -lt 0 -or $i -ge $ui.Articles.Count) { return }
+    $a = $ui.Articles[$i]
+    $newsReader.ShowArticle($a.Title, $a.When, $a.Html)
 }
 
 function Start-RmrNewsFetch {
@@ -4833,6 +5136,7 @@ function Start-RmrNewsFetch {
     if (-not $s) { return }
     $key = Get-RmrServerKey $s
     if ($ui.NewsFor -eq $key -and ($ui.NewsTask -or ([DateTime]::UtcNow - $ui.NewsAt).TotalSeconds -lt 60)) { return }
+    if ($ui.NewsFor -ne $key -or $ui.Articles.Count -eq 0) { Set-RmrNewsMessage 'Loading news...' }
     $ui.NewsFor = $key
     $ui.NewsAt = [DateTime]::UtcNow
     $ui.NewsTask = $null
@@ -4841,7 +5145,6 @@ function Start-RmrNewsFetch {
         $ui.NewsClient.Dispose()
         $ui.NewsClient = $null
     }
-    if ($ui.Articles.Count -eq 0) { Set-RmrNewsMessage 'Loading news...' }
     if ($s.host -eq $script:RmrFadingDevHost) {
         $ui.NewsTask = [RmrClient.LauncherNews]::FetchAsync([string]$s.host, [int]$s.port)
         return
@@ -4870,6 +5173,7 @@ function Receive-RmrNews {
     if (-not $selected -or $ui.NewsFor -ne (Get-RmrServerKey $selected)) { return }
     try {
         $json = $task.GetAwaiter().GetResult()
+        if ($json -ceq $ui.NewsPayload) { return }
         if ($json -notmatch '^\s*\[') { throw 'Expected a news article list.' }
         $items = ConvertFrom-Json -InputObject $json
         $articles = @(
@@ -4878,20 +5182,33 @@ function Receive-RmrNews {
                 $when = ''
                 try { $when = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$a.time).LocalDateTime.ToString('d MMM yyyy  HH:mm') } catch { }
                 $body = if ($null -ne $a.html) { $a.html } else { $a.body }
-                [pscustomobject]@{ Title = [string]$a.title; When = $when; Text = (ConvertTo-RmrText ([string]$body)) }
+                $key = if ($a.id) { [string]$a.id } else { [string]$a.time + '/' + [string]$a.title }
+                [pscustomobject]@{ Key = $key; Title = [string]$a.title; When = $when; Html = [string]$body }
             }
         )
     } catch {
         if ($ui.Articles.Count -eq 0) { Set-RmrNewsMessage 'News is unavailable.' }
         return
     }
-    if ($articles.Count -eq 0) { Set-RmrNewsMessage 'No news has been published.'; return }
+    if ($articles.Count -eq 0) { Set-RmrNewsMessage 'No news has been published.'; $ui.NewsPayload = $json; return }
+    $selectedKey = if ($news.SelectedIndex -ge 0) { $ui.Articles[$news.SelectedIndex].Key }
     $ui.Articles = $articles
+    $ui.NewsPayload = $json
+    $ui.UpdatingNews = $true
     $news.BeginUpdate()
     try {
         $news.Items.Clear()
-        foreach ($a in $articles) { [void]$news.Items.Add($a.Title) }
-    } finally { $news.EndUpdate() }
+        $select = 0
+        foreach ($a in $articles) {
+            $i = $news.Items.Add($a.Title)
+            if ($a.Key -ceq $selectedKey) { $select = $i }
+        }
+        $news.SelectedIndex = $select
+    } finally {
+        $ui.UpdatingNews = $false
+        $news.EndUpdate()
+    }
+    Show-RmrSelectedArticle
 }
 
 # Every few seconds: can each server's game port be reached?
@@ -4951,62 +5268,42 @@ $list.Add_DrawItem({
     $nameFont.Dispose(); $smallFont.Dispose(); $b1.Dispose(); $b2.Dispose()
 })
 
+$newsHeadlineFont = New-Object Drawing.Font('Segoe UI Semibold', 10.5)
+$newsDateFont = New-Object Drawing.Font('Segoe UI', 8.5)
+$newsDateFlags = [Windows.Forms.TextFormatFlags]'NoPrefix, SingleLine, EndEllipsis'
+$newsTitleFlags = [Windows.Forms.TextFormatFlags]'NoPrefix, WordBreak, EndEllipsis'
 $news.Add_DrawItem({
     param($sender, $e)
-    if ($e.Index -lt 0) { return }
+    if ($e.Index -lt 0 -or $e.Index -ge $ui.Articles.Count) { return }
     $g = $e.Graphics
-    $brush = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(12, 17, 24))
+    $a = $ui.Articles[$e.Index]
+    $selected = ($e.State -band [Windows.Forms.DrawItemState]::Selected) -ne 0
+    $back = if ($selected) { [Drawing.Color]::FromArgb(26, 43, 52) } else { $news.BackColor }
+    $brush = New-Object Drawing.SolidBrush($back)
     $g.FillRectangle($brush, $e.Bounds); $brush.Dispose()
-    $b1 = New-Object Drawing.SolidBrush($bright)
-    $b2 = New-Object Drawing.SolidBrush($muted)
-    $b3 = New-Object Drawing.SolidBrush($red)
-    $titleFont = New-Object Drawing.Font('Segoe UI Semibold', 12)
-    $smallFont = New-Object Drawing.Font('Segoe UI', 9)
-    if ($ui.Articles.Count -eq 0) {
-        $g.DrawString($ui.NewsMessage, $smallFont, $b2, (New-Object Drawing.RectangleF(($e.Bounds.X + 16), ($e.Bounds.Y + 14), ($e.Bounds.Width - 32), 50)))
-    } else {
-        $a = $ui.Articles[$e.Index]
-        $g.DrawString($a.When.ToUpper(), $smallFont, $b3, ($e.Bounds.X + 16), ($e.Bounds.Y + 8))
-        $g.DrawString($a.Title, $titleFont, $b1, ($e.Bounds.X + 16), ($e.Bounds.Y + 24))
-        $snippet = ($a.Text -replace '\s+', ' ')
-        if ($snippet.Length -gt 160) { $snippet = $snippet.Substring(0, 157) + '...' }
-        $g.DrawString($snippet, $smallFont, $b2, (New-Object Drawing.RectangleF(($e.Bounds.X + 16), ($e.Bounds.Y + 50), ($e.Bounds.Width - 32), 22)))
-        $pen = New-Object Drawing.Pen([Drawing.Color]::FromArgb(30, 38, 48))
-        $g.DrawLine($pen, $e.Bounds.X, ($e.Bounds.Bottom - 1), $e.Bounds.Right, ($e.Bounds.Bottom - 1)); $pen.Dispose()
+    if ($selected) {
+        $edge = New-Object Drawing.SolidBrush($cyan)
+        $g.FillRectangle($edge, $e.Bounds.X, $e.Bounds.Y, 3, $e.Bounds.Height); $edge.Dispose()
     }
-    $b1.Dispose(); $b2.Dispose(); $b3.Dispose(); $titleFont.Dispose(); $smallFont.Dispose()
+    $dateColor = if ($selected) { $cyan } else { $muted }
+    $dateBounds = New-Object Drawing.Rectangle(($e.Bounds.X + 12), ($e.Bounds.Y + 8), ($e.Bounds.Width - 24), 17)
+    $titleBounds = New-Object Drawing.Rectangle(($e.Bounds.X + 12), ($e.Bounds.Y + 26), ($e.Bounds.Width - 24), ($e.Bounds.Height - 29))
+    [Windows.Forms.TextRenderer]::DrawText($g, $a.When.ToUpperInvariant(), $newsDateFont, $dateBounds, $dateColor, $newsDateFlags)
+    [Windows.Forms.TextRenderer]::DrawText($g, $a.Title, $newsHeadlineFont, $titleBounds, $bright, $newsTitleFlags)
+    $pen = New-Object Drawing.Pen([Drawing.Color]::FromArgb(30, 38, 48))
+    $g.DrawLine($pen, $e.Bounds.X, ($e.Bounds.Bottom - 1), $e.Bounds.Right, ($e.Bounds.Bottom - 1)); $pen.Dispose()
+    if (($e.State -band [Windows.Forms.DrawItemState]::Focus) -ne 0) { $e.DrawFocusRectangle() }
 })
 
 # ---- actions ----
 
-$news.Add_DoubleClick({
-    $i = $news.SelectedIndex
-    if ($i -lt 0 -or $i -ge $ui.Articles.Count) { return }
-    $a = $ui.Articles[$i]
-    $reader = New-Object Windows.Forms.Form
-    $reader.Text = $a.Title
-    $reader.StartPosition = 'CenterParent'
-    $reader.ClientSize = New-Object Drawing.Size(640, 520)
-    $reader.BackColor = [Drawing.Color]::FromArgb(14, 18, 24)
-    $box = New-Object Windows.Forms.TextBox
-    $box.Multiline = $true; $box.ReadOnly = $true; $box.ScrollBars = 'Vertical'
-    $box.Dock = 'Fill'; $box.BorderStyle = 'None'
-    $box.BackColor = [Drawing.Color]::FromArgb(14, 18, 24); $box.ForeColor = $bright
-    $box.Font = New-Object Drawing.Font('Segoe UI', 10.5)
-    $box.Text = ($a.When + "`r`n`r`n" + $a.Title.ToUpper() + "`r`n`r`n" + $a.Text) -replace "(?<!`r)`n", "`r`n"
-    $reader.Controls.Add($box)
-    [void]$reader.ShowDialog($form)
-    $reader.Dispose()
-})
+$news.Add_SelectedIndexChanged({ Show-RmrSelectedArticle })
 
 $list.Add_SelectedIndexChanged({
     if ($list.SelectedIndex -ge 0) {
         $settings.selected = $list.SelectedIndex
         Save-RmrSettings
     }
-    $ui.NewsFor = ''
-    $ui.Articles = @()
-    $news.Items.Clear()
     Update-RmrHeader
     Start-RmrNewsFetch
 })
@@ -5126,4 +5423,4 @@ $form.Add_FormClosed({
 
 try { [Windows.Forms.Application]::Run($form) }
 catch { [Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Red Moon Rising', 'OK', 'Error') | Out-Null }
-finally { $timer.Dispose(); $form.Dispose() }
+finally { $timer.Dispose(); $form.Dispose(); $newsHeadlineFont.Dispose(); $newsDateFont.Dispose() }
