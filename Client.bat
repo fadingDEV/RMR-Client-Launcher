@@ -1512,17 +1512,20 @@ def _rmr_install_alliance_logos():
     try:
         import uix
         import zlib
+        import struct
         cls = form.AlliancesHome
         if getattr(cls, '_rmr_alliance_logos', None):
             return
         original_logo = uix.GetAllianceLogo
         cached = {}
+        cached_sizes = {}
 
         class AllianceLogoUpdates:
             __notifyevents__ = ['OnAllianceLogoChanged']
 
             def OnAllianceLogoChanged(self, allianceID):
                 cached.pop(allianceID, None)
+                cached_sizes.pop(allianceID, None)
 
         def get_logo(allianceID, *args, **kwargs):
             logo = original_logo(allianceID, *args, **kwargs)
@@ -1533,6 +1536,7 @@ def _rmr_install_alliance_logos():
                     data = eve.RemoteSvc('allianceRegistry').GetAllianceLogoImage(allianceID)
                     path = None
                     if data:
+                        cached_sizes[allianceID] = struct.unpack('>I', data[16:20])[0]
                         name = 'rmr-alliance-%d-%08x.png' % (allianceID, zlib.crc32(data) & 4294967295)
                         handle = file(blue.os.cachepath + name, 'wb')
                         try:
@@ -1547,7 +1551,7 @@ def _rmr_install_alliance_logos():
                     logo.tripass = eve.rot.GetInstance('res:/ui/pass/linear.blue')
                     logo.texture.pixels = path
                     logo.rectLeft = logo.rectTop = 0
-                    logo.rectWidth = logo.rectHeight = 128
+                    logo.rectWidth = logo.rectHeight = cached_sizes[allianceID]
             except:
                 _rmr_log('Alliance logo load failed: ' + str(sys.exc_info()[1]))
                 sys.exc_clear()
@@ -1591,6 +1595,71 @@ def _rmr_install_alliance_logos():
         sys.exc_clear()
 
 uthread.new(_rmr_install_alliance_logos)
+
+def _rmr_install_archived_portraits():
+    while not getattr(eve.session, 'charid', None):
+        blue.pyos.synchro.Sleep(1000)
+    try:
+        import uix
+        import zlib
+        cls = eve.LocalSvc('photo').__class__
+        if getattr(cls, '_rmr_archived_portraits', False):
+            return
+        original = cls.OrderPortraits
+        paths = {}
+        available = [True]
+
+        def order_portraits(self, orderlist):
+            if not available[0] or not getattr(eve.session, 'charid', None):
+                return original(self, orderlist)
+            try:
+                ids = list(set(charid for charid, sprite, size in orderlist if charid and charid not in paths))
+                for start in xrange(0, len(ids), 24):
+                    batch = ids[start:start + 24]
+                    pictures = eve.RemoteSvc('charmgr').GetArchivedPortraits(batch)
+                    if not isinstance(pictures, dict):
+                        continue
+                    for charid in batch:
+                        data = pictures.get(charid)
+                        path = None
+                        if data:
+                            name = 'rmr-portrait-%d-%08x.jpg' % (charid, zlib.crc32(data) & 4294967295)
+                            path = 'cache:/' + name
+                            if self.CheckAvail(path) is None:
+                                handle = file(blue.os.cachepath + name, 'wb')
+                                try:
+                                    handle.write(data)
+                                finally:
+                                    handle.close()
+                        paths[charid] = path
+            except:
+                available[0] = False
+                _rmr_log('Archived portrait fetch failed: ' + str(sys.exc_info()[1]))
+                sys.exc_clear()
+                return original(self, orderlist)
+
+            pending = []
+            for order in orderlist:
+                charid, sprite, size = order
+                path = paths.get(charid)
+                if path:
+                    try:
+                        uix.MapSprite(None, sprite, path, rectWidth=256, rectHeight=256)
+                        sprite.tripass = eve.rot.GetInstance('res:/UI/Pass/linear.blue')
+                        continue
+                    except:
+                        sys.exc_clear()
+                pending.append(order)
+            if pending:
+                return original(self, pending)
+
+        cls.OrderPortraits = order_portraits
+        cls._rmr_archived_portraits = True
+    except:
+        _rmr_log('Archived portrait setup failed: ' + ''.join(traceback.format_exception(*sys.exc_info())))
+        sys.exc_clear()
+
+uthread.new(_rmr_install_archived_portraits)
 
 def _rmr_editable_focus(ui):
     import xtriui
@@ -4365,12 +4434,12 @@ namespace RmrClient {
 
     // Render the feed's HTML as native text and links in the launcher.
     public sealed class NewsReader : Wpf.Forms.Integration.ElementHost {
-        private static readonly Media.Brush Background = Brush(12, 17, 24);
-        private static readonly Media.Brush TextColor = Brush(218, 226, 234);
-        private static readonly Media.Brush Muted = Brush(154, 170, 188);
-        private static readonly Media.Brush Accent = Brush(111, 216, 199);
-        private static readonly Media.Brush Rule = Brush(40, 54, 68);
-        private static readonly Media.Brush CodeFill = Brush(21, 31, 43);
+        private static readonly Media.Brush Background = Brush(43, 44, 44);
+        private static readonly Media.Brush TextColor = Brush(232, 235, 241);
+        private static readonly Media.Brush Muted = Brush(190, 196, 189);
+        private static readonly Media.Brush Accent = Brush(240, 205, 130);
+        private static readonly Media.Brush Rule = Brush(72, 74, 73);
+        private static readonly Media.Brush CodeFill = Brush(50, 51, 51);
         private static readonly Media.FontFamily FixedWidth = new Media.FontFamily("Consolas");
         private static readonly Regex Links = new Regex(@"https?://[^\s<>""']+", RegexOptions.IgnoreCase);
         private static readonly Regex Entities = new Regex(@"&(?!#(?:[0-9]+|x[0-9a-fA-F]+);)(?:[a-zA-Z][a-zA-Z0-9]*;)?");
@@ -4647,52 +4716,7 @@ namespace RmrClient {
         }
     }
 
-    public sealed class SkyForm : Form {
-        private readonly Timer animation;
-        private readonly DateTime started = DateTime.UtcNow;
-        public SkyForm() {
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-            animation = new Timer();
-            animation.Interval = 200;
-            animation.Tick += delegate { if (Visible && WindowState != FormWindowState.Minimized && Form.ActiveForm == this) Invalidate(false); };
-            animation.Start();
-        }
-        protected override void OnPaintBackground(PaintEventArgs e) {
-            Rectangle bounds = ClientRectangle;
-            if (bounds.Width < 1 || bounds.Height < 1) return;
-            Graphics g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var background = new LinearGradientBrush(bounds, Color.FromArgb(6, 10, 18), Color.FromArgb(22, 10, 14), 35f))
-                g.FillRectangle(background, bounds);
-            // A red moon low on the right, as on the box art.
-            int r = Math.Max(bounds.Height, 400);
-            var moon = new Rectangle(bounds.Width - r / 2, bounds.Height - r / 3, r, r);
-            using (var path = new GraphicsPath()) {
-                path.AddEllipse(moon);
-                using (var glow = new PathGradientBrush(path)) {
-                    glow.CenterColor = Color.FromArgb(120, 150, 30, 26);
-                    glow.SurroundColors = new Color[] { Color.FromArgb(0, 40, 6, 8) };
-                    g.FillEllipse(glow, moon);
-                }
-            }
-            double time = (DateTime.UtcNow - started).TotalSeconds;
-            var random = new Random(3913);
-            for (int i = 0; i < 170; i++) {
-                float x = (float)random.NextDouble() * bounds.Width;
-                float y = (float)random.NextDouble() * bounds.Height;
-                double phase = random.NextDouble() * Math.PI * 2;
-                double speed = 0.3 + random.NextDouble() * 0.5;
-                float radius = i % 13 == 0 ? 1.4f : 0.7f;
-                int alpha = (int)(30 + 110 * (0.5 + 0.5 * Math.Sin(time * speed + phase)));
-                using (var star = new SolidBrush(Color.FromArgb(alpha, 200, 215, 230)))
-                    g.FillEllipse(star, x, y, radius * 2, radius * 2);
-            }
-        }
-        protected override void Dispose(bool disposing) {
-            if (disposing) { animation.Stop(); animation.Dispose(); }
-            base.Dispose(disposing);
-        }
-    }
+
 }
 '@
 }
@@ -4833,7 +4857,7 @@ function Edit-RmrServerEntry($Entry) {
     $dialog.MaximizeBox = $false; $dialog.MinimizeBox = $false
     $dialog.StartPosition = 'CenterParent'
     $dialog.ClientSize = New-Object Drawing.Size(420, 268)
-    $dialog.BackColor = [Drawing.Color]::FromArgb(14, 18, 24)
+    $dialog.BackColor = [Drawing.Color]::FromArgb(34, 35, 35)
     $dialog.ForeColor = [Drawing.Color]::FromArgb(220, 228, 236)
     $dialog.Font = New-Object Drawing.Font('Segoe UI', 10)
     $fields = @()
@@ -4841,11 +4865,11 @@ function Edit-RmrServerEntry($Entry) {
     foreach ($spec in @(@('Name', 'name', 'My server'), @('Address (IPv4 or hostname)', 'host', ''), @('Game port', 'port', '26000'), @('News port (the server''s Dashboard.bat port)', 'newsPort', '18080'))) {
         $label = New-Object Windows.Forms.Label
         $label.Text = $spec[0]
-        $label.ForeColor = [Drawing.Color]::FromArgb(140, 150, 162)
+        $label.ForeColor = [Drawing.Color]::FromArgb(190, 196, 189)
         $label.SetBounds(18, $y, 384, 20)
         $box = New-Object Windows.Forms.TextBox
         $box.SetBounds(18, ($y + 20), 384, 24)
-        $box.BackColor = [Drawing.Color]::FromArgb(24, 31, 40)
+        $box.BackColor = [Drawing.Color]::FromArgb(50, 51, 51)
         $box.ForeColor = [Drawing.Color]::White
         $box.BorderStyle = 'FixedSingle'
         $box.Text = if ($Entry) { [string]$Entry.($spec[1]) } else { $spec[2] }
@@ -4857,8 +4881,8 @@ function Edit-RmrServerEntry($Entry) {
     $ok.Text = 'Save'
     $ok.DialogResult = 'OK'
     $ok.FlatStyle = 'Flat'
-    $ok.BackColor = [Drawing.Color]::FromArgb(79, 202, 182)
-    $ok.ForeColor = [Drawing.Color]::FromArgb(6, 18, 15)
+    $ok.BackColor = [Drawing.Color]::FromArgb(240, 205, 130)
+    $ok.ForeColor = [Drawing.Color]::FromArgb(36, 35, 31)
     $ok.SetBounds(222, 226, 86, 30)
     $cancel = New-Object Windows.Forms.Button
     $cancel.Text = 'Cancel'
@@ -4888,35 +4912,37 @@ function Edit-RmrServerEntry($Entry) {
 # ---- the window ----
 
 [Windows.Forms.Application]::EnableVisualStyles()
-$bright = [Drawing.Color]::FromArgb(236, 242, 248)
-$muted = [Drawing.Color]::FromArgb(140, 152, 166)
-$cyan = [Drawing.Color]::FromArgb(79, 202, 182)
-$red = [Drawing.Color]::FromArgb(224, 83, 63)
-$panel = [Drawing.Color]::FromArgb(12, 17, 24)
+$bright = [Drawing.Color]::FromArgb(232, 235, 241)
+$muted = [Drawing.Color]::FromArgb(190, 196, 189)
+$gold = [Drawing.Color]::FromArgb(240, 205, 130)
+$green = [Drawing.Color]::FromArgb(118, 212, 166)
+$red = [Drawing.Color]::FromArgb(240, 136, 114)
+$panel = [Drawing.Color]::FromArgb(43, 44, 44)
 
-$form = New-Object RmrClient.SkyForm
+$form = New-Object Windows.Forms.Form
 $form.Text = 'Red Moon Rising'
 $form.StartPosition = 'CenterScreen'
 $form.ClientSize = New-Object Drawing.Size(1180, 700)
 $form.MinimumSize = New-Object Drawing.Size(980, 620)
 $form.ForeColor = $bright
+$form.BackColor = [Drawing.Color]::FromArgb(34, 35, 35)
 $form.Font = New-Object Drawing.Font('Segoe UI', 10)
 
 $title = New-Object Windows.Forms.Label
 $title.Text = 'RED MOON RISING'
-$title.Font = New-Object Drawing.Font('Segoe UI Light', 26)
+$title.Font = New-Object Drawing.Font('Segoe UI Semibold', 23)
 $title.ForeColor = $bright
 $title.BackColor = [Drawing.Color]::Transparent
 $title.SetBounds(24, 14, 520, 50)
 $subtitle = New-Object Windows.Forms.Label
-$subtitle.Text = 'EVE ONLINE 2.10  /  BUILD 3913  /  LAUNCHER'
-$subtitle.Font = New-Object Drawing.Font('Segoe UI', 8.5, [Drawing.FontStyle]::Bold)
+$subtitle.Text = 'EVE 2.10  /  BUILD 3913'
+$subtitle.Font = New-Object Drawing.Font('Consolas', 9)
 $subtitle.ForeColor = $red
 $subtitle.BackColor = [Drawing.Color]::Transparent
 $subtitle.SetBounds(28, 62, 520, 18)
 $statusPill = New-Object Windows.Forms.Label
 $statusPill.TextAlign = 'MiddleRight'
-$statusPill.Font = New-Object Drawing.Font('Segoe UI', 9.5, [Drawing.FontStyle]::Bold)
+$statusPill.Font = New-Object Drawing.Font('Consolas', 9.5)
 $statusPill.BackColor = [Drawing.Color]::Transparent
 $statusPill.Anchor = 'Top,Right'
 $statusPill.SetBounds(($form.ClientSize.Width - 524), 28, 500, 24)
@@ -4928,7 +4954,7 @@ $side.Anchor = 'Top,Bottom,Left'
 $side.SetBounds(24, 96, 300, ($form.ClientSize.Height - 120))
 $serversCaption = New-Object Windows.Forms.Label
 $serversCaption.Text = 'SERVERS'
-$serversCaption.Font = New-Object Drawing.Font('Segoe UI', 8.5, [Drawing.FontStyle]::Bold)
+$serversCaption.Font = New-Object Drawing.Font('Consolas', 9)
 $serversCaption.ForeColor = $muted
 $serversCaption.BackColor = [Drawing.Color]::Transparent
 $serversCaption.SetBounds(16, 14, 200, 18)
@@ -4936,7 +4962,7 @@ $list = New-Object Windows.Forms.ListBox
 $list.DrawMode = 'OwnerDrawFixed'
 $list.ItemHeight = 56
 $list.BorderStyle = 'None'
-$list.BackColor = [Drawing.Color]::FromArgb(12, 17, 24)
+$list.BackColor = [Drawing.Color]::FromArgb(43, 44, 44)
 $list.ForeColor = $bright
 $list.IntegralHeight = $false
 $list.Anchor = 'Top,Bottom,Left,Right'
@@ -4949,8 +4975,8 @@ foreach ($pair in @(@($addButton, '+ Add'), @($editButton, 'Edit'), @($removeBut
     $b = $pair[0]
     $b.Text = $pair[1]
     $b.FlatStyle = 'Flat'
-    $b.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(44, 54, 66)
-    $b.BackColor = [Drawing.Color]::FromArgb(20, 27, 36)
+    $b.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(72, 74, 73)
+    $b.BackColor = [Drawing.Color]::FromArgb(50, 51, 51)
     $b.ForeColor = $bright
     $b.Anchor = 'Bottom,Left'
     $b.SetBounds($x, ($side.Height - 222), 88, 30)
@@ -4976,8 +5002,8 @@ foreach ($pair in @(@($folderButton, 'Change folder'), @($repairButton, 'Repair 
     $b = $pair[0]
     $b.Text = $pair[1]
     $b.FlatStyle = 'Flat'
-    $b.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(44, 54, 66)
-    $b.BackColor = [Drawing.Color]::FromArgb(20, 27, 36)
+    $b.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(72, 74, 73)
+    $b.BackColor = [Drawing.Color]::FromArgb(50, 51, 51)
     $b.ForeColor = $bright
     $b.Anchor = 'Bottom,Left'
     $b.SetBounds($x, ($side.Height - 106), 135, 30)
@@ -5006,7 +5032,7 @@ $news = New-Object Windows.Forms.ListBox
 $news.DrawMode = 'OwnerDrawFixed'
 $news.ItemHeight = 72
 $news.BorderStyle = 'None'
-$news.BackColor = [Drawing.Color]::FromArgb(16, 23, 32)
+$news.BackColor = [Drawing.Color]::FromArgb(29, 30, 30)
 $news.ForeColor = $bright
 $news.IntegralHeight = $false
 $news.AccessibleName = 'News headlines'
@@ -5016,12 +5042,12 @@ $newsReader = New-Object RmrClient.NewsReader
 $newsReader.Dock = 'Fill'
 $newsPane.Controls.AddRange(@($newsReader, $news))
 $playButton = New-Object Windows.Forms.Button
-$playButton.Text = 'PLAY'
-$playButton.Font = New-Object Drawing.Font('Segoe UI Semibold', 20)
+$playButton.Text = 'Play'
+$playButton.Font = New-Object Drawing.Font('Segoe UI Semibold', 16)
 $playButton.FlatStyle = 'Flat'
 $playButton.FlatAppearance.BorderSize = 0
-$playButton.BackColor = $cyan
-$playButton.ForeColor = [Drawing.Color]::FromArgb(6, 18, 15)
+$playButton.BackColor = $gold
+$playButton.ForeColor = [Drawing.Color]::FromArgb(36, 35, 31)
 $playButton.Cursor = [Windows.Forms.Cursors]::Hand
 $playButton.Anchor = 'Bottom,Right'
 $playButton.SetBounds(($form.ClientSize.Width - 284), ($form.ClientSize.Height - 96), 260, 72)
@@ -5033,6 +5059,17 @@ $playStatus.Anchor = 'Bottom,Left,Right'
 $playStatus.SetBounds(348, ($form.ClientSize.Height - 90), ($form.ClientSize.Width - 648), 60)
 
 $form.Controls.AddRange(@($title, $subtitle, $statusPill, $side, $newsCaption, $newsPane, $playButton, $playStatus))
+$brandPath = Join-Path $SourceRoot 'crates\eve-server\web\eve-icon.png'
+if (Test-Path -LiteralPath $brandPath -PathType Leaf) {
+    $brand = New-Object Windows.Forms.PictureBox
+    $brand.ImageLocation = $brandPath
+    $brand.SizeMode = 'Zoom'
+    $brand.SetBounds(24, 24, 40, 40)
+    $form.Controls.Add($brand)
+    $title.Left = 75
+    $subtitle.Left = 79
+}
+
 
 # ---- state ----
 
@@ -5107,7 +5144,7 @@ function Update-RmrHeader {
     $s = Get-RmrSelected
     if (-not $s) { $statusPill.Text = ''; return }
     $state = $ui.Status[(Get-RmrServerKey $s)]
-    if ($state -eq 'online') { $statusPill.ForeColor = $cyan; $statusPill.Text = ([string][char]0x25CF) + '  ' + $s.name.ToUpper() + '  ONLINE' }
+    if ($state -eq 'online') { $statusPill.ForeColor = $green; $statusPill.Text = ([string][char]0x25CF) + '  ' + $s.name.ToUpper() + '  ONLINE' }
     elseif ($state -eq 'offline') { $statusPill.ForeColor = $red; $statusPill.Text = ([string][char]0x25CF) + '  ' + $s.name.ToUpper() + '  OFFLINE' }
     else { $statusPill.ForeColor = $muted; $statusPill.Text = ([string][char]0x25CF) + '  ' + $s.name.ToUpper() + '  CHECKING' }
     $newsCaption.Text = 'NEWS FROM ' + $s.name.ToUpper()
@@ -5245,15 +5282,15 @@ $list.Add_DrawItem({
     $s = @($settings.servers)[$e.Index]
     $g = $e.Graphics
     $selected = ($e.State -band [Windows.Forms.DrawItemState]::Selected) -ne 0
-    $back = if ($selected) { [Drawing.Color]::FromArgb(28, 44, 52) } else { [Drawing.Color]::FromArgb(12, 17, 24) }
+    $back = if ($selected) { [Drawing.Color]::FromArgb(58, 59, 58) } else { [Drawing.Color]::FromArgb(43, 44, 44) }
     $brush = New-Object Drawing.SolidBrush($back)
     $g.FillRectangle($brush, $e.Bounds); $brush.Dispose()
     if ($selected) {
-        $edge = New-Object Drawing.SolidBrush($cyan)
+        $edge = New-Object Drawing.SolidBrush($gold)
         $g.FillRectangle($edge, $e.Bounds.X, $e.Bounds.Y, 3, $e.Bounds.Height); $edge.Dispose()
     }
     $state = $ui.Status[(Get-RmrServerKey $s)]
-    $dot = if ($state -eq 'online') { $cyan } elseif ($state -eq 'offline') { $red } else { $muted }
+    $dot = if ($state -eq 'online') { $green } elseif ($state -eq 'offline') { $red } else { $muted }
     $dotBrush = New-Object Drawing.SolidBrush($dot)
     $g.SmoothingMode = 'AntiAlias'
     $g.FillEllipse($dotBrush, ($e.Bounds.X + 14), ($e.Bounds.Y + 15), 9, 9); $dotBrush.Dispose()
@@ -5278,19 +5315,19 @@ $news.Add_DrawItem({
     $g = $e.Graphics
     $a = $ui.Articles[$e.Index]
     $selected = ($e.State -band [Windows.Forms.DrawItemState]::Selected) -ne 0
-    $back = if ($selected) { [Drawing.Color]::FromArgb(26, 43, 52) } else { $news.BackColor }
+    $back = if ($selected) { [Drawing.Color]::FromArgb(58, 59, 58) } else { $news.BackColor }
     $brush = New-Object Drawing.SolidBrush($back)
     $g.FillRectangle($brush, $e.Bounds); $brush.Dispose()
     if ($selected) {
-        $edge = New-Object Drawing.SolidBrush($cyan)
+        $edge = New-Object Drawing.SolidBrush($gold)
         $g.FillRectangle($edge, $e.Bounds.X, $e.Bounds.Y, 3, $e.Bounds.Height); $edge.Dispose()
     }
-    $dateColor = if ($selected) { $cyan } else { $muted }
+    $dateColor = if ($selected) { $gold } else { $muted }
     $dateBounds = New-Object Drawing.Rectangle(($e.Bounds.X + 12), ($e.Bounds.Y + 8), ($e.Bounds.Width - 24), 17)
     $titleBounds = New-Object Drawing.Rectangle(($e.Bounds.X + 12), ($e.Bounds.Y + 26), ($e.Bounds.Width - 24), ($e.Bounds.Height - 29))
     [Windows.Forms.TextRenderer]::DrawText($g, $a.When.ToUpperInvariant(), $newsDateFont, $dateBounds, $dateColor, $newsDateFlags)
     [Windows.Forms.TextRenderer]::DrawText($g, $a.Title, $newsHeadlineFont, $titleBounds, $bright, $newsTitleFlags)
-    $pen = New-Object Drawing.Pen([Drawing.Color]::FromArgb(30, 38, 48))
+    $pen = New-Object Drawing.Pen([Drawing.Color]::FromArgb(72, 74, 73))
     $g.DrawLine($pen, $e.Bounds.X, ($e.Bounds.Bottom - 1), $e.Bounds.Right, ($e.Bounds.Bottom - 1)); $pen.Dispose()
     if (($e.State -band [Windows.Forms.DrawItemState]::Focus) -ne 0) { $e.DrawFocusRectangle() }
 })
